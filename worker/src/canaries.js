@@ -33,7 +33,13 @@ export async function mintCanaries(env, origin, where) {
 
 // canarytokens.org values are alphanumeric, but this text becomes a shell
 // script, so strip anything else anyway.
-const clean = (v) => String(v || "").replace(/[^A-Za-z0-9+/=._-]/g, "");
+// An empty value means the canarytokens.org response changed shape: fail
+// rather than plant blank credentials that can never trip.
+const clean = (v, fallback) => {
+	const out = String(v || "").replace(/[^A-Za-z0-9+/=._-]/g, "") || fallback;
+	if (!out) throw new Error("canarytokens.org response is missing a field");
+	return out;
+};
 
 export function plantScript({ aws, envFile, dns }) {
 	return `#!/bin/sh
@@ -51,7 +57,7 @@ if ! grep -qs ${MARK} "$HOME/.aws/credentials"; then
 [backup-admin]
 aws_access_key_id = ${clean(aws.aws_access_key_id)}
 aws_secret_access_key = ${clean(aws.aws_secret_access_key)}
-region = ${clean(aws.region) || "us-east-2"}
+region = ${clean(aws.region, "us-east-2")}
 CANARY
 	planted="$planted ~/.aws/credentials"
 fi
@@ -61,7 +67,7 @@ if [ ! -e "$HOME/Documents/prod-secrets.env" ]; then
 # production backup credentials (rotated quarterly)
 AWS_ACCESS_KEY_ID=${clean(envFile.aws_access_key_id)}
 AWS_SECRET_ACCESS_KEY=${clean(envFile.aws_secret_access_key)}
-AWS_DEFAULT_REGION=${clean(envFile.region) || "us-east-2"}
+AWS_DEFAULT_REGION=${clean(envFile.region, "us-east-2")}
 S3_BACKUP_BUCKET=prod-db-backups
 CANARY
 	planted="$planted ~/Documents/prod-secrets.env"

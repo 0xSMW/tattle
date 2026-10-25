@@ -1,4 +1,4 @@
-# tattle — design
+# tattle: design
 
 Security monitoring for one person who runs a handful of laptops and servers and
 has no SOC. Free to run. Assumes every machine will eventually be compromised, and
@@ -29,81 +29,88 @@ machine can reach.
  ┌──────────────────────┐   POST     ┌──────────────────────┐
  │ collector (launchd / │──────────▶ │ Worker: /ingest       │
  │ systemd timer, daily)│ per-host   │  write-once to R2     │
- └──────────────────────┘  token     │  (bucket lock 90d)    │
-                                     │ cron: missed check-in │──▶ ntfy ──▶ phone
- canarytokens.org ── trip ──────────────────────────────────────▶ ntfy + email
+ └──────────────────────┘  token     │  diff vs last report  │──▶ ntfy ──▶ phone
+                                     │ cron: missed check-in │──▶ ntfy
+ canarytokens.org ── trip ─────────▶ │ /canary               │──▶ ntfy (max priority)
                                      └──────────┬───────────┘
                                                 │ read-only token
                                      ┌──────────▼───────────┐
-                                     │ analyzer (scheduler)  │
-                                     │  daily: deterministic │──▶ ntfy (only on
-                                     │   diff, alert on bad  │    high-signal)
-                                     │  weekly: LLM digest,  │──▶ digest
-                                     │   read-only tools     │
+                                     │ weekly digest        │
+                                     │ (planned: LLM with   │
+                                     │  read-only tools)    │
                                      └──────────────────────┘
 ```
 
 ### collector
 
-One POSIX shell script per OS. No dependencies beyond the base system (optionally
-`lynis` and `osqueryi` when present). Produces one JSON document per run with fixed
-sections:
+One POSIX shell script for macOS and Linux (`collector/tattle-collect`), run daily
+as root. No dependencies beyond the base system; `lynis` is used weekly when
+present. `tattle-collect --print` shows the report instead of sending it.
 
 | section | macOS | Linux |
 |---|---|---|
-| identity | hostname, serial, OS version | hostname, machine-id, OS, kernel |
-| accounts | admin group members, users with UID ≥ 500 | sudo/wheel members, UID ≥ 1000, UID 0 accounts |
-| ssh | authorized_keys fingerprints per user, sshd config hash | same |
-| listening | listening TCP/UDP sockets with process | same |
-| persistence | LaunchAgents/Daemons (paths + hashes), login items, cron, profiles | systemd units enabled, cron, rc.local, /etc/ld.so.preload |
-| posture | FileVault, SIP, Gatekeeper, firewall, auto-updates | ufw/nftables summary, unattended-upgrades, pending security updates |
-| packages | brew list, /Applications bundle IDs + versions | dpkg/rpm list hash + count |
-| tailscale | `tailscale status --json` self + peers (names only) | same |
-| lynis | — | hardening index + warnings (weekly) |
+| identity | hostname, OS version, serial | hostname, machine-id, OS, kernel |
+| accounts | admin group members, users with UID ≥ 500 | sudo/wheel/docker/lxd/libvirt members, UID 0 and ≥ 1000 accounts |
+| ssh | authorized_keys fingerprints, keys without a passphrase, remote login | same, plus the effective sshd settings that matter |
+| listening | listening sockets with process | same |
+| persistence | LaunchAgents/Daemons (path + hash), cron, profiles, sudoers hash | enabled units, unit file hashes, cron, ld.so.preload, rc.local, sudoers |
+| posture | FileVault, SIP, Gatekeeper, firewall, update settings, auto-login, guest, screen sharing | ufw/nftables, unattended upgrades |
+| updates | recommended updates, last successful update | pending and security updates, reboot required |
+| exposure | app firewall allow list, `tailscale serve`/`funnel` | `tailscale serve`/`funnel` |
+| containers | | running containers and published ports |
+| credentials | path and mode of known credential files (never contents) | same |
+| packages | /Applications, brew | package count and hash |
+| tailscale | self and peer names and OS | same |
+| lynis | | hardening index and warnings (Sundays) |
 
 The collector never sends file contents beyond what is listed, and never sends
-secrets. The ingest token is the only credential on the machine.
+secrets. The ingest token is the only credential on the machine. Reports are
+gzipped and posted to `/ingest`.
 
-### worker (Cloudflare Worker + R2)
+### worker (Cloudflare Worker + R2 + KV)
 
 - `POST /ingest` with `Authorization: Bearer <host token>`. Tokens are stored as
-  SHA-256 hashes mapped to a host name; a token can only write as its own host.
-- Writes `reports/<host>/<ISO timestamp>.json`. Never overwrites, never deletes,
-  exposes no read endpoint. R2 bucket lock retention (90 days) backs this up at the
-  storage layer.
-- Records `lastSeen/<host>` in KV.
-- Cron trigger (hourly): any host past its expected interval (default 36h) raises
-  one ntfy alert, then one reminder per day until it reports again.
-- `POST /canary` webhook target for canarytokens.org, forwarding to ntfy at max
-  priority. (Canary emails go to you directly as a second channel.)
+  SHA-256 hashes mapped to a host name, so a token can only write as its own host.
+- Writes `reports/<host>/<ISO timestamp>-<random>.json` and never overwrites or
+  deletes. An R2 bucket lock (90 days) enforces this at the storage layer.
+- Compares the report with the host's previous one (kept in KV) and alerts on:
+  new admin/sudo/UID 0 accounts, new SSH keys, new persistence items, a process
+  newly listening on a non-loopback address, and any posture change. Everything
+  else stays in the stored reports.
+- Hourly cron: a host silent for longer than `STALE_HOURS` (default 36) raises an
+  alert, then one reminder a day until it reports again. If `HEARTBEAT_URL` is
+  set, each cron run pings it, so an outside dead-man's switch notices if the
+  worker itself is deleted.
+- `POST /canary?key=…` receives canarytokens.org webhooks and alerts at max
+  priority.
+- `GET /install.sh`, `GET /tattle-collect`: the installer and collector, served
+  from this repo so every machine runs the version you deployed.
+- `GET /canaries.sh` (host token): mints canaries for that host and returns a
+  script that plants them.
+- `GET /hosts`, `/reports`, `/report` (read token): last-seen times and stored
+  reports, for `tattle status` and the digest.
 
-### analyzer
+### weekly digest (planned)
 
-Runs on any scheduler you have (cron, launchd, a CI schedule, an agent
-platform's automation). Holds a read-only R2 token, no other credentials.
-
-- **daily (deterministic):** for each host, diff the newest report against the
-  previous one. Alert via ntfy on: new admin/sudo/UID-0 account, new SSH key, new
-  persistence item, new listening port, posture regression (FileVault off,
-  firewall off, SIP off, auto-updates off). Everything else goes into the weekly
-  digest only.
-- **weekly (LLM):** copy the week's reports and diffs into a scratch directory,
-  run a model with read-only file tools over it, and produce a short digest: what
-  changed, what looks wrong, what to fix first. Output is a summary for a human,
-  never an action.
+Copy the week's reports into a scratch directory on a machine that is not one of
+your most privileged ones, and run a model with read-only file tools over it to
+write a short digest: what changed, what looks wrong, what to fix first. Output is
+a summary for a human, never an action. Every byte in those reports may have been
+written by an attacker, so the model gets no shell, network or credentials.
 
 ### canaries
 
-A setup script that, given canarytokens.org tokens, plants per machine:
+At install, the worker mints canarytokens.org tokens for that machine and plants
+them in the home directory of the person who uses it (root on a server):
 
-- a fake AWS profile appended to `~/.aws/credentials` under a plausible name
-  (never `default`, never replacing real profiles)
-- a fake `.env` in a likely repo directory
-- a fake private SSH key with a DNS-token comment
-- a "passwords" document token in the home directory
+- a fake AWS profile appended to `~/.aws/credentials` under `[backup-admin]`
+  (existing profiles are left alone)
+- `~/Documents/prod-secrets.env` with a second fake AWS key
+- a `Host db-backup-prod` entry in `~/.ssh/config` whose hostname is a DNS token
 
-Each token's memo records host and location so an alert says exactly which machine
-and which file was touched.
+Each token's memo records host, user and file, so an alert says exactly which
+machine and which file was touched. Planting is idempotent; set
+`TATTLE_NO_CANARIES=1` to skip it.
 
 ## Hardening baseline (documented, not automated)
 

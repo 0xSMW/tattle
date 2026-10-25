@@ -1,13 +1,18 @@
 #!/bin/sh
 # Install the tattle collector and schedule it daily.
 #
-#   curl -fsSL https://<your worker>/install.sh | sudo sh -s -- <host token>
+#   curl -fsSL https://<your worker>/install.sh | sudo sh -s -- <host token> [--no-canaries]
 #
 # Re-running is safe: it updates the collector and keeps the schedule.
+# Everything is inside main(), so a download cut short runs nothing.
 set -eu
 
-TOKEN=${1:?usage: install.sh <host token>}
-URL=${TATTLE_URL:-__TATTLE_URL__}
+main() {
+TOKEN=${1:-}
+echo "$TOKEN" | grep -Eq '^[0-9a-f]{64}$' || { echo "usage: install.sh <host token> [--no-canaries]" >&2; exit 1; }
+CANARIES=yes
+[ "${2:-}" = --no-canaries ] || [ -n "${TATTLE_NO_CANARIES:-}" ] && CANARIES=
+URL=__TATTLE_URL__
 DIR=/usr/local/libexec/tattle
 
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
@@ -82,12 +87,22 @@ else
 fi
 
 # Canaries for the person who uses this machine (or root on a server).
-# Set TATTLE_NO_CANARIES=1 to skip.
-if [ -z "${TATTLE_NO_CANARIES:-}" ]; then
-	if [ "$(uname -s)" = Darwin ]; then CUSER=${SUDO_USER:-$(stat -f%Su /dev/console)}; else CUSER=${SUDO_USER:-root}; fi
-	CHOME=$(eval echo "~$CUSER")
-	curl -fsS -H "Authorization: Bearer $TOKEN" "$URL/canaries.sh?user=$CUSER" -o "$DIR/canaries.sh"
-	sh -n "$DIR/canaries.sh"
-	if [ "$CUSER" = root ]; then HOME=$CHOME sh "$DIR/canaries.sh"; else sudo -u "$CUSER" HOME="$CHOME" sh "$DIR/canaries.sh"; fi
-	rm -f "$DIR/canaries.sh"
+# Pass --no-canaries to skip.
+if [ -n "$CANARIES" ]; then
+	if [ "$(uname -s)" = Darwin ]; then
+		CUSER=${SUDO_USER:-$(stat -f%Su /dev/console)}
+		CHOME=$(dscl . -read "/Users/$CUSER" NFSHomeDirectory | awk '{ print $2 }')
+	else
+		CUSER=${SUDO_USER:-root}
+		CHOME=$(getent passwd "$CUSER" | cut -d: -f6)
+	fi
+	PLANT=$(mktemp)
+	printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - "$URL/canaries.sh?user=$CUSER" -o "$PLANT"
+	sh -n "$PLANT"
+	chmod 644 "$PLANT"
+	if [ "$CUSER" = root ]; then HOME=$CHOME sh "$PLANT"; else sudo -u "$CUSER" HOME="$CHOME" sh "$PLANT"; fi
+	rm -f "$PLANT"
 fi
+}
+
+main "$@"

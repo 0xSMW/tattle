@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { diffSections } from "../src/diff.js";
 
 const base = {
-	accounts: "admin: bruno root\nuser: bruno 501",
+	accounts: "admin: alice root\nuser: alice 501",
 	ssh: "remote-login: Off",
 	persistence: "abc /Library/LaunchDaemons/a.plist",
 	posture: "filevault: FileVault is On.\nfirewall: enabled",
-	listening: "Dropbox bruno *:17500\nbb bruno 127.0.0.1:38886",
+	listening: "Dropbox alice *:17500\nbb alice 127.0.0.1:38886",
 	packages: "Foo.app 1.0",
 };
 
@@ -18,7 +18,7 @@ test("no change, no findings", () => {
 test("new admin, ssh key and launch daemon alert", () => {
 	const after = {
 		...base,
-		accounts: "admin: bruno evil root\nuser: bruno 501",
+		accounts: "admin: alice evil root\nuser: alice 501",
 		ssh: "remote-login: Off\nroot SHA256:xyz key",
 		persistence: base.persistence + "\ndef /Library/LaunchDaemons/evil.plist",
 	};
@@ -33,9 +33,9 @@ test("posture regression alerts", () => {
 });
 
 test("loopback and port churn are ignored; new exposed process alerts", () => {
-	const quiet = { ...base, listening: "Dropbox bruno *:17501\nbb bruno 127.0.0.1:40000\nnode bruno 127.0.0.1:3000" };
+	const quiet = { ...base, listening: "Dropbox alice *:17501\nbb alice 127.0.0.1:40000\nnode alice 127.0.0.1:3000" };
 	assert.deepEqual(diffSections(base, quiet), []);
-	const loud = { ...base, listening: base.listening + "\nnc bruno *:4444" };
+	const loud = { ...base, listening: base.listening + "\nnc alice *:4444" };
 	assert.deepEqual(diffSections(base, loud), ["+ listening: nc now accepts connections from the network"]);
 });
 
@@ -57,4 +57,9 @@ test("plant script strips shell metacharacters from token values", () => {
 	assert.ok(!script.includes("$(rm"));
 	assert.ok(!script.includes("`y`"));
 	assert.ok(script.includes("HostName abc.canarytokens.comreboot"));
+});
+
+test("plantScript refuses blank canary values", () => {
+	const aws = { aws_access_key_id: "", aws_secret_access_key: "x" };
+	assert.throws(() => plantScript({ aws, envFile: aws, dns: { hostname: "h.example" } }));
 });

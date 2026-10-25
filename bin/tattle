@@ -43,6 +43,8 @@ READ_TOKEN=$(rand)
 CANARY_KEY=$(rand)
 NTFY_URL=https://ntfy.sh/tattle-$(rand | cut -c1-24)
 HEARTBEAT_URL=
+CANARY_EMAIL=
+NTFY_TOKEN=
 EOF
 	[ -f "$HOSTS" ] || echo '{}' >"$HOSTS"
 	echo "wrote $SECRETS. Subscribe to the NTFY_URL topic in the ntfy app, set TATTLE_URL after the first deploy, then run tattle deploy."
@@ -54,7 +56,10 @@ deploy)
 	put_secret READ_TOKEN "$READ_TOKEN"
 	put_secret CANARY_KEY "$CANARY_KEY"
 	put_secret NTFY_URL "$NTFY_URL"
-	[ -n "${HEARTBEAT_URL:-}" ] && put_secret HEARTBEAT_URL "$HEARTBEAT_URL"
+	for opt in HEARTBEAT_URL CANARY_EMAIL NTFY_TOKEN; do
+		eval "v=\${$opt:-}"
+		[ -z "$v" ] || put_secret "$opt" "$v"
+	done
 	echo "deployed. Canary webhook: $TATTLE_URL/canary?key=<CANARY_KEY from $SECRETS>"
 	;;
 add-host)
@@ -68,6 +73,8 @@ add-host)
 	echo
 	echo "  curl -fsSL $TATTLE_URL/install.sh | sudo sh -s -- $token"
 	echo
+	echo "Add --no-canaries after the token to skip planting canaries."
+	echo
 	echo "The token is shown once. Commit $HOSTS (it holds only the hash)."
 	;;
 remove-host)
@@ -75,7 +82,8 @@ remove-host)
 	name=${2:?usage: tattle remove-host NAME}
 	python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.pop(sys.argv[2]); json.dump(d, open(p,"w"), indent=2, sort_keys=True)' "$HOSTS" "$name"
 	put_secret HOST_TOKENS "$(hosts_json)"
-	echo "revoked $name"
+	for k in "seen/$name" "last/$name"; do wr kv key delete --binding STATE --remote "$k" >/dev/null 2>&1 || true; done
+	echo "revoked $name (its stored reports are kept)"
 	;;
 status)
 	load

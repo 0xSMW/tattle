@@ -37,10 +37,46 @@ from a real audit. tattle reports on most of these but does not change them.
 - Docker-published ports bypass ufw/firewalld. Bind to 127.0.0.1 or the tailnet
   IP, never 0.0.0.0, unless the port is meant to be public.
 - Behind Cloudflare: allow 80/443 only from Cloudflare's IP ranges, or anyone who
-  finds the origin IP bypasses the WAF.
+  finds the origin IP bypasses the WAF. Test each proxied hostname with
+  `curl --resolve host:443:<origin ip> https://host/`. Any 2xx or 3xx means the
+  origin is reachable directly.
 - A GitHub self-hosted runner on a production box means anyone who can push a
-  workflow can run code there. Restrict runner groups to specific workflows.
+  workflow can run code there. Restrict runner groups to specific workflows and
+  make runners ephemeral.
+- Servers don't need CUPS (port 631), SSH agent or TCP forwarding, or a Claude or
+  other AI login (`~/.claude/.credentials.json`). If auth failures are high and
+  nothing like fail2ban is running, move SSH behind Tailscale.
 - No plaintext passwords in `~/.ssh/config` comments.
+- App secret files (`.env`, `application.yml`, platform env files) mode 600, owned
+  by the app user. A 644 `.env` can be read by every account on the box.
+- No database dumps, backup exports or one-off probe scripts left in app users'
+  home directories. They are usually full of customer data.
+- Reboot after kernel updates. `/var/run/reboot-required` that is weeks old means
+  the running kernel is unpatched however current the packages look.
+- On home or office machines that also run Tailscale, bind sshd, dev servers and
+  dashboards to the tailnet address or 127.0.0.1, not 0.0.0.0, so the LAN can't
+  reach them.
+- Machines running AI agents should not hold production database credentials,
+  even read-only ones. One prompt injection or one bad `npx`/`uvx` package reads
+  all of it. Give agents a masked replica.
+
+## Cloud accounts
+
+- No admin or IAMFullAccess policy on application keys. Delete keys older than a
+  year or unused for a year, and require MFA for every console user.
+- CloudTrail that nobody reads is not monitoring. Send it somewhere that alerts.
+- Lambda Function URLs with `AuthType NONE` are public endpoints. Check that each
+  one is meant to be.
+
+## Secrets and images
+
+- Each environment gets its own secrets. Compare SHA-256 prefixes (never the
+  values) of keys like `SECRET_KEY_BASE`, `RAILS_MASTER_KEY` and encryption keys
+  across production, staging and demo. If they match, a staging leak is a
+  production leak.
+- Images, snapshots and templates inherit the trust of the machine they were
+  built from. After a compromise, list everything built from or copying files
+  from that machine and rebuild it.
 
 ## Trust between machines
 
@@ -62,5 +98,20 @@ from a real audit. tattle reports on most of these but does not change them.
   members without 2FA are removed).
 - Fine-grained, expiring tokens. A `gh` token with `workflow` scope can rewrite CI
   in every repo it reaches.
-- Sweep public DNS (zone files plus certificate transparency on crt.sh) for
-  forgotten hosts and records that point at IPs you no longer own.
+- Sweep public DNS for forgotten hosts: zone files, certificate transparency
+  (crt.sh often returns 502s, and certspotter works as a fallback) and a list of
+  common labels. Flag records that point at IPs you no longer own, CNAMEs to
+  hosted services whose target no longer exists (takeover candidates on Heroku,
+  Fly, Shopify, hosted dashboards and the like), registrar parking records that
+  point at third-party domains, and secondary domains with no DMARC or
+  `sp=none`.
+- A known_hosts host-key mismatch for an address you own is worth chasing. It is
+  often the first sign that the IP was released and now belongs to someone else.
+- Fetch every owned hostname and look for takeover fingerprints: "Site not
+  found", Heroku "Application Error" or "no such app", S3 `NoSuchBucket`.
+- A required status check that anyone with write access can post (a custom
+  "signoff" status, say) is not branch protection.
+- Set the default workflow token permission to read, and remove collaborators
+  with no activity.
+- Review GitHub Apps that can write contents and workflows on every repo, and
+  pin third-party Actions to a commit SHA rather than a branch or tag.

@@ -12,13 +12,17 @@
 //   HEARTBEAT_URL optional secret: pinged every cron run, so an outside
 //               dead-man's switch (e.g. healthchecks.io) notices if this
 //               worker is deleted or stops running.
+//   NTFY_TOKEN  optional secret: ntfy access token, for a reserved topic or
+//               a self-hosted server.
+//   CANARY_EMAIL  optional var: canarytokens.org also emails trips here.
 
 import collectorScript from "../../collector/tattle-collect";
 import installScript from "../../collector/install.sh";
 import { diffSections } from "./diff.js";
 import { mintCanaries, plantScript } from "./canaries.js";
 
-const MAX_BODY = 4 * 1024 * 1024;
+const MAX_BODY = 2 * 1024 * 1024; // decompressed
+const MIN_INTERVAL_MS = 3600 * 1000; // one report per host per hour
 
 export default {
 	async fetch(request, env) {
@@ -51,21 +55,22 @@ async function ingest(request, env) {
 	const host = await hostForToken(request, env);
 	if (!host) return new Response("unauthorized\n", { status: 401 });
 
+	// A compromised host must not be able to burn the KV write or ntfy quotas
+	// that every other host's alerts depend on.
+	const now = new Date();
+	const seen = (await env.STATE.get(`seen/${host}`, "json")) || {};
+	if (seen.at && now - Date.parse(seen.at) < MIN_INTERVAL_MS) return new Response("too soon\n", { status: 429 });
+
 	const report = await readReport(request);
 	if (!report) return new Response("bad report\n", { status: 400 });
 
-	const now = new Date();
 	const key = `reports/${host}/${now.toISOString()}-${crypto.randomUUID().slice(0, 8)}.json`;
-	const body = JSON.stringify({ host, receivedAt: now.toISOString(), ...report });
+	const body = JSON.stringify({ ...report, host, receivedAt: now.toISOString() });
 	await env.REPORTS.put(key, body, { httpMetadata: { contentType: "application/json" } });
 
+	// Alert before saving the new baseline: if ntfy fails, this request fails,
+	// the collector retries, and the same change is found again.
 	const previous = await env.STATE.get(`last/${host}`, "json");
-	await env.STATE.put(`last/${host}`, JSON.stringify(report.sections));
-
-	const seen = (await env.STATE.get(`seen/${host}`, "json")) || {};
-	await env.STATE.put(`seen/${host}`, JSON.stringify({ at: now.toISOString(), staleAlertedAt: null }));
-	if (seen.staleAlertedAt) await notify(env, `${host} is reporting again`, "It had gone quiet.", { priority: 3, tags: "white_check_mark" });
-
 	if (previous) {
 		const findings = diffSections(previous, report.sections);
 		if (findings.length) {
@@ -75,18 +80,37 @@ async function ingest(request, env) {
 			});
 		}
 	}
+	if (seen.staleAlertedAt) await notify(env, `${host} is reporting again`, "It had gone quiet.", { priority: 3, tags: "white_check_mark" });
+
+	await env.STATE.put(`last/${host}`, JSON.stringify(report.sections));
+	await env.STATE.put(`seen/${host}`, JSON.stringify({ at: now.toISOString(), staleAlertedAt: null }));
 	return new Response("ok\n");
 }
 
 async function readReport(request) {
-	const length = Number(request.headers.get("content-length") || 0);
-	if (length > MAX_BODY) return null;
+	if (!request.body) return null;
 	let stream = request.body;
 	if ((request.headers.get("content-type") || "").includes("gzip")) {
 		stream = stream.pipeThrough(new DecompressionStream("gzip"));
 	}
-	const text = await new Response(stream).text();
-	if (text.length > MAX_BODY * 4) return null;
+	// Count decompressed bytes as they arrive, so neither a missing
+	// Content-Length nor a gzip bomb gets past the limit.
+	let total = 0;
+	stream = stream.pipeThrough(
+		new TransformStream({
+			transform(chunk, controller) {
+				total += chunk.byteLength;
+				if (total > MAX_BODY) controller.error(new Error("report too large"));
+				else controller.enqueue(chunk);
+			},
+		}),
+	);
+	let text;
+	try {
+		text = await new Response(stream).text();
+	} catch {
+		return null;
+	}
 	let report;
 	try {
 		report = JSON.parse(text);
@@ -232,10 +256,10 @@ function timingSafeEqual(a, b) {
 
 async function notify(env, title, message, { priority = 3, tags = "" } = {}) {
 	if (!env.NTFY_URL) return console.log("ntfy not configured:", title, message);
-	const res = await fetch(env.NTFY_URL, {
-		method: "POST",
-		body: message.slice(0, 3800),
-		headers: { Title: title.slice(0, 200), Priority: String(priority), Tags: tags },
-	});
-	if (!res.ok) console.error("ntfy failed", res.status, await res.text());
+	const headers = { Title: title.replace(/[\r\n]+/g, " ").slice(0, 200), Priority: String(priority), Tags: tags };
+	if (env.NTFY_TOKEN) headers.Authorization = `Bearer ${env.NTFY_TOKEN}`;
+	const res = await fetch(env.NTFY_URL, { method: "POST", body: message.slice(0, 3800), headers });
+	// Throw, so the caller's request fails and gets retried instead of the
+	// alert being lost.
+	if (!res.ok) throw new Error(`ntfy failed: ${res.status} ${await res.text()}`);
 }

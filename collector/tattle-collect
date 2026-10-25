@@ -8,7 +8,9 @@
 # Reads TATTLE_URL and TATTLE_TOKEN from /etc/tattle/env.
 
 set -u
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin
+# System directories only. This runs as root, and /usr/local/bin and
+# /opt/homebrew/bin are often writable by an ordinary user.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH LC_ALL=C
 
 VERSION=1
@@ -20,11 +22,34 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Tools that may live outside the system directories, accepted only from a
+# root-owned path that no one else can write to.
+# Group-writable is fine when the group is one whose members can sudo anyway.
+ADMIN_GID=0
+[ "$OS" = Darwin ] && ADMIN_GID=80
+trusted() {
+	for f in "$@"; do
+		[ -x "$f" ] || continue
+		d=$f ok=1
+		while [ "$d" != / ] && [ -n "$d" ]; do
+			[ -n "$(find "$d" -maxdepth 0 -user root ! -perm -002 \( ! -perm -020 -o -group 0 -o -group "$ADMIN_GID" \) 2>/dev/null)" ] || { ok=; break; }
+			d=$(dirname "$d")
+		done
+		[ -n "$ok" ] && { echo "$f"; return 0; }
+	done
+	return 1
+}
+TAILSCALE=$(trusted /usr/bin/tailscale /usr/sbin/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale /usr/local/bin/tailscale) || TAILSCALE=""
+LYNIS=$(trusted /usr/sbin/lynis /usr/bin/lynis /usr/local/bin/lynis) || LYNIS=""
+DOCKER=$(trusted /usr/bin/docker /usr/local/bin/docker) || DOCKER=""
+
 # Escape stdin as the body of a JSON string.
+# Escaping is done in sed, because awk implementations disagree about
+# backslashes in gsub replacements.
+TAB=$(printf '\t')
 jstr() {
-	tr -d '\000-\010\013\014\016-\037' | awk '
-		{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "")
-		  printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }'
+	tr -d '\000-\010\013-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$TAB/\\\\t/g" |
+		awk '{ printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }'
 }
 
 # section NAME COMMAND...: run COMMAND, keep its output under NAME.
@@ -65,7 +90,7 @@ credential_files() {
 	for home in "$@"; do
 		for rel in .aws/credentials .config/gh/hosts.yml .wrangler/config Library/Preferences/.wrangler/config \
 			.config/hcloud/cli.toml .fly/config.yml .config/gcloud/credentials.db .modal.toml .docker/config.json \
-			.npmrc .netrc .pgpass .kube/config .config/op .heroku .config/doctl/config.yaml .vault-token; do
+			.npmrc .netrc .pgpass .kube/config .config/op .heroku .config/doctl/config.yaml .vault-token .claude/.credentials.json; do
 			f="$home/$rel"
 			[ -e "$f" ] || continue
 			if [ "$OS" = Darwin ]; then m=$(stat -f %Lp "$f"); else m=$(stat -c %a "$f"); fi
@@ -74,9 +99,23 @@ credential_files() {
 	done
 }
 
+# App secrets other accounts can read, and data dumps left in home directories.
+# Paths, modes and sizes only, never contents.
+linux_loose_files() {
+	for home in "$@"; do
+		[ "$home" = / ] && continue
+		find "$home" -xdev -maxdepth 4 -name node_modules -prune -o -type f \
+			\( -name .env -o -name '.env.*' -o -name '*.env' -o -name application.yml -o -name .asdf-vars \) \
+			-perm -004 -print 2>/dev/null | while read -r f; do echo "world-readable: $f mode $(stat -c %a "$f")"; done
+		find "$home" -xdev -maxdepth 3 -name node_modules -prune -o -type f \
+			\( -name '*.sql' -o -name '*.sql.gz' -o -name '*.dump' -o -name '*backup*.json' \) \
+			-size +1M -print 2>/dev/null | while read -r f; do echo "data-dump: $f $(du -h "$f" | cut -f1)"; done
+	done
+}
+
 tailscale_exposure() {
-	ts=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
-	[ -x "$ts" ] || return 0
+	ts=$TAILSCALE
+	[ -n "$ts" ] || return 0
 	"$ts" serve status 2>/dev/null | grep -E 'https?://|tcp://|proxy|path' | sed 's/^ */serve: /'
 	"$ts" funnel status 2>/dev/null | grep -iE 'funnel on|https://' | sed 's/^ */funnel: /'
 }
@@ -100,6 +139,10 @@ mac_identity() {
 mac_accounts() {
 	echo "admin: $(dscl . -read /Groups/admin GroupMembership | cut -d' ' -f2- | tr ' ' '\n' | sort | tr '\n' ' ')"
 	dscl . -list /Users UniqueID | awk '$2 >= 500 || $2 == 0 { print "user:", $1, $2 }'
+	# GroupMembership misses admins added by GUID or through a nested group.
+	for u in $(dscl . -list /Users UniqueID | awk '$2 >= 500 { print $1 }'); do
+		dsmemberutil checkmembership -U "$u" -G admin 2>/dev/null | grep -q 'is a member' && echo "is-admin: $u"
+	done
 }
 
 mac_ssh() {
@@ -164,8 +207,11 @@ mac_packages() {
 }
 
 tailscale_peers() {
-	ts=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
-	[ -x "$ts" ] || { echo "not installed"; return; }
+	ts=$TAILSCALE
+	if [ -z "$ts" ]; then
+		[ -e /Applications/Tailscale.app ] && echo "skipped: Tailscale.app is not root-owned" || echo "not installed"
+		return
+	fi
 	"$ts" status 2>/dev/null | awk '$1 ~ /^100\./ { print $2, $4 }' | sort
 }
 
@@ -173,7 +219,7 @@ tailscale_peers() {
 
 linux_identity() {
 	hostname
-	. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"
+	[ -r /etc/os-release ] && (. /etc/os-release; echo "${PRETTY_NAME:-}")
 	uname -r
 	cat /etc/machine-id 2>/dev/null
 }
@@ -188,12 +234,15 @@ linux_accounts() {
 }
 
 linux_ssh() {
-	have sshd && sshd -T 2>/dev/null | grep -E '^(port|listenaddress|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile) '
+	have sshd && sshd -T 2>/dev/null | grep -E '^(port|listenaddress|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile|allowtcpforwarding|allowagentforwarding|x11forwarding|gatewayports) '
 	ssh_keys $(home_dirs)
 	unprotected_keys $(home_dirs)
 }
 
 linux_exposure() {
+	# Docker and Tailscale rewrite nftables rules on their own, so this lives
+	# here rather than in posture, where every change raises an alert.
+	have nft && echo "nftables-ruleset: $(nft list ruleset 2>/dev/null | sha256sum | cut -c1-16)"
 	tailscale_exposure
 }
 
@@ -216,14 +265,14 @@ linux_persistence() {
 
 linux_posture() {
 	have ufw && ufw status 2>/dev/null | head -1
-	have nft && echo "nftables rules: $(nft list ruleset 2>/dev/null | grep -c .)"
 	[ -f /etc/apt/apt.conf.d/20auto-upgrades ] && grep -h Unattended /etc/apt/apt.conf.d/20auto-upgrades
 	systemctl is-enabled unattended-upgrades dnf-automatic.timer 2>/dev/null | sed 's/^/auto-updates: /'
 }
 
 # Kept out of posture: these change daily, and posture changes raise alerts.
 linux_updates() {
-	[ -f /var/run/reboot-required ] && echo "reboot-required: yes"
+	[ -f /var/run/reboot-required ] && echo "reboot-required: since $(date -u -r /var/run/reboot-required +%Y-%m-%d 2>/dev/null || echo yes)"
+	echo "up-since: $(uptime -s 2>/dev/null | cut -d' ' -f1)"
 	if have apt; then
 		echo "pending-updates: $(apt list --upgradable 2>/dev/null | grep -c upgradable)"
 		echo "pending-security: $(apt list --upgradable 2>/dev/null | grep -c -- -security)"
@@ -231,7 +280,7 @@ linux_updates() {
 }
 
 linux_containers() {
-	have docker && docker ps --format '{{.Image}} {{.Names}} {{.Ports}}' 2>/dev/null | sort
+	[ -n "$DOCKER" ] && "$DOCKER" ps --format '{{.Image}} {{.Names}} {{.Ports}}' 2>/dev/null | sort
 }
 
 linux_packages() {
@@ -241,10 +290,10 @@ linux_packages() {
 }
 
 linux_lynis() {
-	have lynis || { echo "not installed"; return; }
+	[ -n "$LYNIS" ] || { echo "not installed"; return; }
 	# Weekly: Lynis is slow, and its findings rarely change day to day.
 	[ "$(date +%u)" = 7 ] || [ "${TATTLE_LYNIS:-}" = always ] || { echo "skipped (runs Sundays)"; return; }
-	lynis audit system --quick --quiet --no-colors >/dev/null 2>&1
+	"$LYNIS" audit system --quick --quiet --no-colors >/dev/null 2>&1
 	grep -E '^(hardening_index|warning\[\]|suggestion\[\])=' /var/log/lynis-report.dat 2>/dev/null
 }
 
@@ -272,6 +321,7 @@ else
 	section updates linux_updates
 	section exposure linux_exposure
 	section credentials credential_files $(home_dirs)
+	section files linux_loose_files $(home_dirs)
 	section containers linux_containers
 	section packages linux_packages
 	section tailscale tailscale_peers
@@ -298,7 +348,8 @@ fi
 
 : "${TATTLE_URL:?set TATTLE_URL in /etc/tattle/env}" "${TATTLE_TOKEN:?set TATTLE_TOKEN in /etc/tattle/env}"
 gzip -c "$TMP/report.json" >"$TMP/report.json.gz"
-curl -fsS --retry 3 --retry-delay 30 --max-time 120 \
-	-H "Authorization: Bearer $TATTLE_TOKEN" \
+# The token goes to curl on stdin, so other users can't read it from ps.
+printf 'header = "Authorization: Bearer %s"\n' "$TATTLE_TOKEN" |
+	curl -fsS --retry 3 --retry-delay 30 --max-time 120 -K - \
 	-H "Content-Type: application/gzip" \
 	--data-binary "@$TMP/report.json.gz" "$TATTLE_URL/ingest"
