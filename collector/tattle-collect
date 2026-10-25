@@ -1,0 +1,304 @@
+#!/bin/sh
+# tattle-collect: snapshot this machine's security-relevant state and ship it
+# off the box. Plain shell, no dependencies. Run as root (launchd / systemd).
+#
+#   tattle-collect            collect and upload
+#   tattle-collect --print    collect and print the JSON, upload nothing
+#
+# Reads TATTLE_URL and TATTLE_TOKEN from /etc/tattle/env.
+
+set -u
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin
+export PATH LC_ALL=C
+
+VERSION=1
+[ -r /etc/tattle/env ] && . /etc/tattle/env
+
+OS=$(uname -s)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/tattle.XXXXXX") || exit 1
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Escape stdin as the body of a JSON string.
+jstr() {
+	tr -d '\000-\010\013\014\016-\037' | awk '
+		{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "")
+		  printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }'
+}
+
+# section NAME COMMAND...: run COMMAND, keep its output under NAME.
+SECTIONS=""
+section() {
+	name=$1; shift
+	"$@" >"$TMP/$name" 2>/dev/null
+	SECTIONS="$SECTIONS $name"
+}
+
+ssh_keys() {
+	for home in "$@"; do
+		for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+			[ -f "$f" ] || continue
+			ssh-keygen -lf "$f" 2>/dev/null | awk -v u="${home##*/}" '{ print u, $1, $2, $NF }'
+		done
+	done
+}
+
+# Private keys anyone holding the file can use: no passphrase.
+unprotected_keys() {
+	for home in "$@"; do
+		for f in "$home"/.ssh/*; do
+			[ -f "$f" ] && head -c 40 "$f" 2>/dev/null | grep -q 'PRIVATE KEY' || continue
+			ssh-keygen -y -P "" -f "$f" >/dev/null 2>&1 && echo "unprotected-key: ${home##*/} ${f#$home/}"
+		done
+		# Fingerprints of this machine's own keys: joined with other machines'
+		# authorized_keys, they show which machine can log into which.
+		for f in "$home"/.ssh/*.pub; do
+			[ -f "$f" ] && ssh-keygen -lf "$f" 2>/dev/null | awk -v u="${home##*/}" '{ print "own-key:", u, $2 }'
+		done
+	done
+}
+
+# Where long-lived credentials sit, and whether others can read them.
+# Paths and modes only, never contents.
+credential_files() {
+	for home in "$@"; do
+		for rel in .aws/credentials .config/gh/hosts.yml .wrangler/config Library/Preferences/.wrangler/config \
+			.config/hcloud/cli.toml .fly/config.yml .config/gcloud/credentials.db .modal.toml .docker/config.json \
+			.npmrc .netrc .pgpass .kube/config .config/op .heroku .config/doctl/config.yaml .vault-token; do
+			f="$home/$rel"
+			[ -e "$f" ] || continue
+			if [ "$OS" = Darwin ]; then m=$(stat -f %Lp "$f"); else m=$(stat -c %a "$f"); fi
+			echo "${home##*/} ~/$rel mode $m"
+		done
+	done
+}
+
+tailscale_exposure() {
+	ts=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
+	[ -x "$ts" ] || return 0
+	"$ts" serve status 2>/dev/null | grep -E 'https?://|tcp://|proxy|path' | sed 's/^ */serve: /'
+	"$ts" funnel status 2>/dev/null | grep -iE 'funnel on|https://' | sed 's/^ */funnel: /'
+}
+
+home_dirs() {
+	if [ "$OS" = Darwin ]; then
+		ls -d /var/root /Users/* 2>/dev/null | grep -v /Users/Shared
+	else
+		awk -F: '$3 == 0 || $3 >= 1000 { print $6 }' /etc/passwd | sort -u
+	fi
+}
+
+# ---------------------------------------------------------------- macOS
+
+mac_identity() {
+	sw_vers
+	scutil --get ComputerName
+	system_profiler SPHardwareDataType | awk -F': ' '/Serial Number|Model Identifier|Chip|Model Name/ { print $1 ": " $2 }' | sed 's/^ *//'
+}
+
+mac_accounts() {
+	echo "admin: $(dscl . -read /Groups/admin GroupMembership | cut -d' ' -f2- | tr ' ' '\n' | sort | tr '\n' ' ')"
+	dscl . -list /Users UniqueID | awk '$2 >= 500 || $2 == 0 { print "user:", $1, $2 }'
+}
+
+mac_ssh() {
+	echo "remote-login: $(systemsetup -getremotelogin 2>/dev/null | cut -d: -f2)"
+	ssh_keys $(home_dirs)
+	unprotected_keys $(home_dirs)
+}
+
+mac_exposure() {
+	fw=/usr/libexec/ApplicationFirewall/socketfilterfw
+	echo "firewall-allow-signed: $($fw --getallowsigned | tr '\n' ' ')"
+	$fw --listapps 2>/dev/null | awk '/ALF: /{ next } /^[0-9]+ *:/{ sub(/^[0-9]+ *: */, ""); app = $0; next }
+		/Allow incoming/{ print "firewall-allows:", app }'
+	tailscale_exposure
+}
+
+mac_updates() {
+	defaults read /Library/Preferences/com.apple.SoftwareUpdate RecommendedUpdates 2>/dev/null | grep -E 'Display (Name|Version)' | sed 's/^ */available: /'
+	echo "last-successful-check: $(defaults read /Library/Preferences/com.apple.SoftwareUpdate LastSuccessfulDate 2>/dev/null || echo never)"
+}
+
+mac_listening() {
+	lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $1, $3, $9 }' | sort -u
+}
+
+mac_persistence() {
+	for d in /Library/LaunchDaemons /Library/LaunchAgents /Users/*/Library/LaunchAgents; do
+		[ -d "$d" ] || continue
+		find "$d" -maxdepth 1 -name '*.plist' -type f -exec shasum -a 256 {} + 2>/dev/null
+	done | awk '{ print substr($1, 1, 16), $2 }' | sort -k2
+	for u in $(dscl . -list /Users UniqueID | awk '$2 >= 500 { print $1 }'); do
+		crontab -u "$u" -l 2>/dev/null | grep -v '^#' | sed "s/^/cron $u: /"
+	done
+	profiles list -all 2>/dev/null | grep -i 'profileIdentifier' | sed 's/^.*profileIdentifier: */profile: /'
+	[ -f /etc/sudoers ] && echo "sudoers $(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | shasum -a 256 | cut -c1-16)"
+}
+
+mac_posture() {
+	echo "filevault: $(fdesetup status | head -1)"
+	echo "sip: $(csrutil status | sed 's/.*: //')"
+	echo "gatekeeper: $(spctl --status)"
+	echo "firewall: $(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate | sed 's/.*is //')"
+	echo "firewall-stealth: $(/usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode | sed 's/.*is //')"
+	for k in AutomaticCheckEnabled AutomaticDownload AutomaticallyInstallMacOSUpdates CriticalUpdateInstall; do
+		echo "softwareupdate-$k: $(defaults read /Library/Preferences/com.apple.SoftwareUpdate "$k" 2>/dev/null || echo unset)"
+	done
+	echo "autologin: $(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || echo off)"
+	echo "guest: $(defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null || echo unset)"
+	echo "screensharing: $(launchctl print system/com.apple.screensharing >/dev/null 2>&1 && echo on || echo off)"
+}
+
+mac_packages() {
+	for app in /Applications/*.app /Applications/*/*.app; do
+		[ -d "$app" ] || continue
+		v=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null)
+		echo "${app#/Applications/} $v"
+	done
+	user=$(stat -f%Su /dev/console)
+	if [ "$user" != root ] && [ -x /opt/homebrew/bin/brew ]; then
+		sudo -u "$user" /opt/homebrew/bin/brew list --versions 2>/dev/null | sed 's/^/brew /'
+	fi
+}
+
+tailscale_peers() {
+	ts=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
+	[ -x "$ts" ] || { echo "not installed"; return; }
+	"$ts" status 2>/dev/null | awk '$1 ~ /^100\./ { print $2, $4 }' | sort
+}
+
+# ---------------------------------------------------------------- Linux
+
+linux_identity() {
+	hostname
+	. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"
+	uname -r
+	cat /etc/machine-id 2>/dev/null
+}
+
+linux_accounts() {
+	# docker, lxd and libvirt membership is root without a password.
+	for g in sudo wheel admin docker lxd libvirt; do
+		getent group "$g" | awk -F: -v g="$g" '{ print "group " g ": " $4 }'
+	done
+	awk -F: '$3 == 0 || $3 >= 1000 { print "user:", $1, $3, $7 }' /etc/passwd
+	awk -F: '$2 !~ /^[!*]/ && $2 != "" { print "password-set:", $1 }' /etc/shadow 2>/dev/null
+}
+
+linux_ssh() {
+	have sshd && sshd -T 2>/dev/null | grep -E '^(port|listenaddress|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile) '
+	ssh_keys $(home_dirs)
+	unprotected_keys $(home_dirs)
+}
+
+linux_exposure() {
+	tailscale_exposure
+}
+
+linux_listening() {
+	ss -Hltnup 2>/dev/null | awk '{ p = $7; sub(/^users:\(\("/, "", p); sub(/".*/, "", p); print $1, $5, p }' | sort -u
+}
+
+linux_persistence() {
+	systemctl list-unit-files --state=enabled --no-legend 2>/dev/null | awk '{ print "enabled:", $1 }'
+	# Units an admin (or intruder) wrote, as opposed to ones a package shipped.
+	find /etc/systemd/system -name '*.service' -o -name '*.timer' 2>/dev/null | while read -r f; do
+		[ -f "$f" ] && echo "unit $(sha256sum "$f" | cut -c1-16) $f"
+	done
+	find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /var/spool/cron -type f 2>/dev/null \
+		-exec sha256sum {} + | awk '{ print "cron", substr($1, 1, 16), $2 }'
+	[ -s /etc/ld.so.preload ] && sed 's/^/ld.so.preload: /' /etc/ld.so.preload
+	[ -f /etc/rc.local ] && echo "rc.local $(sha256sum /etc/rc.local | cut -c1-16)"
+	echo "sudoers $(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | sha256sum | cut -c1-16)"
+}
+
+linux_posture() {
+	have ufw && ufw status 2>/dev/null | head -1
+	have nft && echo "nftables rules: $(nft list ruleset 2>/dev/null | grep -c .)"
+	[ -f /etc/apt/apt.conf.d/20auto-upgrades ] && grep -h Unattended /etc/apt/apt.conf.d/20auto-upgrades
+	systemctl is-enabled unattended-upgrades dnf-automatic.timer 2>/dev/null | sed 's/^/auto-updates: /'
+}
+
+# Kept out of posture: these change daily, and posture changes raise alerts.
+linux_updates() {
+	[ -f /var/run/reboot-required ] && echo "reboot-required: yes"
+	if have apt; then
+		echo "pending-updates: $(apt list --upgradable 2>/dev/null | grep -c upgradable)"
+		echo "pending-security: $(apt list --upgradable 2>/dev/null | grep -c -- -security)"
+	fi
+}
+
+linux_containers() {
+	have docker && docker ps --format '{{.Image}} {{.Names}} {{.Ports}}' 2>/dev/null | sort
+}
+
+linux_packages() {
+	if have dpkg-query; then dpkg-query -W -f '${Package} ${Version}\n'
+	elif have rpm; then rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' | sort
+	fi
+}
+
+linux_lynis() {
+	have lynis || { echo "not installed"; return; }
+	# Weekly: Lynis is slow, and its findings rarely change day to day.
+	[ "$(date +%u)" = 7 ] || [ "${TATTLE_LYNIS:-}" = always ] || { echo "skipped (runs Sundays)"; return; }
+	lynis audit system --quick --quiet --no-colors >/dev/null 2>&1
+	grep -E '^(hardening_index|warning\[\]|suggestion\[\])=' /var/log/lynis-report.dat 2>/dev/null
+}
+
+# ---------------------------------------------------------------- main
+
+if [ "$OS" = Darwin ]; then
+	section identity mac_identity
+	section accounts mac_accounts
+	section ssh mac_ssh
+	section listening mac_listening
+	section persistence mac_persistence
+	section posture mac_posture
+	section exposure mac_exposure
+	section updates mac_updates
+	section credentials credential_files $(home_dirs)
+	section packages mac_packages
+	section tailscale tailscale_peers
+else
+	section identity linux_identity
+	section accounts linux_accounts
+	section ssh linux_ssh
+	section listening linux_listening
+	section persistence linux_persistence
+	section posture linux_posture
+	section updates linux_updates
+	section exposure linux_exposure
+	section credentials credential_files $(home_dirs)
+	section containers linux_containers
+	section packages linux_packages
+	section tailscale tailscale_peers
+	section lynis linux_lynis
+fi
+
+{
+	printf '{"version":%s,"os":"%s","collectedAt":"%s","sections":{' \
+		"$VERSION" "$OS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	sep=""
+	for s in $SECTIONS; do
+		printf '%s"%s":"' "$sep" "$s"
+		jstr <"$TMP/$s"
+		printf '"'
+		sep=","
+	done
+	printf '}}\n'
+} >"$TMP/report.json"
+
+if [ "${1:-}" = --print ]; then
+	cat "$TMP/report.json"
+	exit 0
+fi
+
+: "${TATTLE_URL:?set TATTLE_URL in /etc/tattle/env}" "${TATTLE_TOKEN:?set TATTLE_TOKEN in /etc/tattle/env}"
+gzip -c "$TMP/report.json" >"$TMP/report.json.gz"
+curl -fsS --retry 3 --retry-delay 30 --max-time 120 \
+	-H "Authorization: Bearer $TATTLE_TOKEN" \
+	-H "Content-Type: application/gzip" \
+	--data-binary "@$TMP/report.json.gz" "$TATTLE_URL/ingest"

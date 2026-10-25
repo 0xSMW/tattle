@@ -1,0 +1,28 @@
+# Copy to wrangler.toml and fill in the IDs. wrangler.toml is gitignored so your
+# account details stay out of the public repo.
+name = "tattle"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[triggers]
+crons = ["17 * * * *"]   # hourly missed-check-in sweep
+
+[vars]
+STALE_HOURS = "36"
+
+[[r2_buckets]]
+binding = "REPORTS"
+bucket_name = "tattle-reports"
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "<kv namespace id>"
+
+# Secrets (wrangler secret put NAME): HOST_TOKENS, READ_TOKEN, CANARY_KEY, NTFY_URL
+
+# Serve the collector and installer as text, straight from the repo.
+[[rules]]
+type = "Text"
+globs = ["**/tattle-collect", "**/*.sh"]
+fallthrough = true

@@ -1,0 +1,100 @@
+#!/bin/sh
+# tattle: operator CLI.
+#
+#   tattle init                 create secrets (read token, canary key, ntfy topic)
+#   tattle deploy               deploy the worker with the current host list
+#   tattle add-host NAME        mint a host token, print the install command
+#   tattle remove-host NAME     revoke a host's token
+#   tattle status               last report time for every host
+#   tattle test-alert           send a test notification through the worker's ntfy topic
+#
+# State lives in two places, deliberately apart:
+#   $TATTLE_DEPLOY  (a private git repo)  wrangler.toml, hosts.json (token hashes only)
+#   $TATTLE_SECRETS (default ~/.config/tattle/secrets.env, mode 600, never committed)
+set -eu
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DEPLOY=${TATTLE_DEPLOY:?set TATTLE_DEPLOY to your private deployment directory}
+SECRETS=${TATTLE_SECRETS:-$HOME/.config/tattle/secrets.env}
+WRANGLER=${WRANGLER:-npx wrangler}
+HOSTS="$DEPLOY/hosts.json"
+
+die() { echo "tattle: $*" >&2; exit 1; }
+rand() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+sha() { printf %s "$1" | shasum -a 256 | cut -d' ' -f1; }
+load() { [ -r "$SECRETS" ] || die "no $SECRETS; run tattle init"; . "$SECRETS"; }
+wr() { (cd "$ROOT/worker" && cp "$DEPLOY/wrangler.toml" wrangler.toml && $WRANGLER "$@"); }
+
+hosts_json() {
+	# hosts.json: {"name": "sha256", ...}  ->  secret: {"sha256": "name", ...}
+	python3 -c 'import json,sys; print(json.dumps({v: k for k, v in json.load(open(sys.argv[1])).items()}))' "$HOSTS"
+}
+
+put_secret() { printf %s "$2" | wr secret put "$1" >/dev/null; }
+
+case "${1:-}" in
+init)
+	[ -e "$SECRETS" ] && die "$SECRETS already exists"
+	mkdir -p "$(dirname "$SECRETS")"
+	umask 077
+	cat >"$SECRETS" <<EOF
+TATTLE_URL=https://tattle.<your-subdomain>.workers.dev
+READ_TOKEN=$(rand)
+CANARY_KEY=$(rand)
+NTFY_URL=https://ntfy.sh/tattle-$(rand | cut -c1-24)
+HEARTBEAT_URL=
+EOF
+	[ -f "$HOSTS" ] || echo '{}' >"$HOSTS"
+	echo "wrote $SECRETS. Subscribe to the NTFY_URL topic in the ntfy app, set TATTLE_URL after the first deploy, then run tattle deploy."
+	;;
+deploy)
+	load
+	wr deploy
+	put_secret HOST_TOKENS "$(hosts_json)"
+	put_secret READ_TOKEN "$READ_TOKEN"
+	put_secret CANARY_KEY "$CANARY_KEY"
+	put_secret NTFY_URL "$NTFY_URL"
+	[ -n "${HEARTBEAT_URL:-}" ] && put_secret HEARTBEAT_URL "$HEARTBEAT_URL"
+	echo "deployed. Canary webhook: $TATTLE_URL/canary?key=<CANARY_KEY from $SECRETS>"
+	;;
+add-host)
+	load
+	name=${2:?usage: tattle add-host NAME}
+	echo "$name" | grep -Eq '^[a-z0-9][a-z0-9.-]*$' || die "host names are lowercase letters, digits, dots and dashes"
+	token=$(rand)
+	python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d[sys.argv[2]]=sys.argv[3]; json.dump(d, open(p,"w"), indent=2, sort_keys=True)' "$HOSTS" "$name" "$(sha "$token")"
+	put_secret HOST_TOKENS "$(hosts_json)"
+	echo "Added $name. On that machine run:"
+	echo
+	echo "  curl -fsSL $TATTLE_URL/install.sh | sudo sh -s -- $token"
+	echo
+	echo "The token is shown once. Commit $HOSTS (it holds only the hash)."
+	;;
+remove-host)
+	load
+	name=${2:?usage: tattle remove-host NAME}
+	python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.pop(sys.argv[2]); json.dump(d, open(p,"w"), indent=2, sort_keys=True)' "$HOSTS" "$name"
+	put_secret HOST_TOKENS "$(hosts_json)"
+	echo "revoked $name"
+	;;
+status)
+	load
+	curl -fsS -H "Authorization: Bearer $READ_TOKEN" "$TATTLE_URL/hosts" | python3 -c '
+import json, sys, datetime
+hosts = json.load(sys.stdin)["hosts"]
+now = datetime.datetime.now(datetime.timezone.utc)
+for name, seen in sorted(hosts.items()):
+    at = datetime.datetime.fromisoformat(seen["at"].replace("Z", "+00:00"))
+    print(f"{name:28} {int((now - at).total_seconds() // 3600):>4}h ago  {at:%Y-%m-%d %H:%M} UTC")
+'
+	;;
+test-alert)
+	load
+	curl -fsS -X POST "$TATTLE_URL/canary?key=$CANARY_KEY" -d '{"memo":"(test) tattle test-alert","channel":"test"}' >/dev/null
+	echo "sent; check your phone"
+	;;
+*)
+	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+	exit 1
+	;;
+esac

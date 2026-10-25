@@ -1,0 +1,93 @@
+#!/bin/sh
+# Install the tattle collector and schedule it daily.
+#
+#   curl -fsSL https://<your worker>/install.sh | sudo sh -s -- <host token>
+#
+# Re-running is safe: it updates the collector and keeps the schedule.
+set -eu
+
+TOKEN=${1:?usage: install.sh <host token>}
+URL=${TATTLE_URL:-__TATTLE_URL__}
+DIR=/usr/local/libexec/tattle
+
+[ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+
+mkdir -p "$DIR" /etc/tattle
+curl -fsSL "$URL/tattle-collect" -o "$DIR/tattle-collect.new"
+sh -n "$DIR/tattle-collect.new"
+mv "$DIR/tattle-collect.new" "$DIR/tattle-collect"
+chmod 755 "$DIR/tattle-collect"
+
+umask 077
+printf 'TATTLE_URL=%s\nTATTLE_TOKEN=%s\n' "$URL" "$TOKEN" >/etc/tattle/env
+chmod 600 /etc/tattle/env
+
+# Spread machines across the night so they don't all report at once.
+HOUR=$(( $(od -An -N1 -tu1 /dev/urandom) % 5 + 2 ))
+MIN=$(( $(od -An -N1 -tu1 /dev/urandom) % 60 ))
+
+if [ "$(uname -s)" = Darwin ]; then
+	PLIST=/Library/LaunchDaemons/dev.tattle.collect.plist
+	cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>dev.tattle.collect</string>
+	<key>ProgramArguments</key><array><string>/bin/sh</string><string>$DIR/tattle-collect</string></array>
+	<key>StartCalendarInterval</key><dict><key>Hour</key><integer>$HOUR</integer><key>Minute</key><integer>$MIN</integer></dict>
+	<key>RunAtLoad</key><true/>
+	<key>StandardOutPath</key><string>/var/log/tattle.log</string>
+	<key>StandardErrorPath</key><string>/var/log/tattle.log</string>
+</dict>
+</plist>
+EOF
+	chmod 644 "$PLIST"
+	launchctl bootout system "$PLIST" 2>/dev/null || true
+	launchctl bootstrap system "$PLIST"
+	echo "tattle: installed, runs daily at $HOUR:$(printf %02d $MIN) and now (log: /var/log/tattle.log)"
+elif command -v systemctl >/dev/null 2>&1; then
+	cat >/etc/systemd/system/tattle.service <<EOF
+[Unit]
+Description=tattle security snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh $DIR/tattle-collect
+Nice=10
+IOSchedulingClass=idle
+EOF
+	cat >/etc/systemd/system/tattle.timer <<EOF
+[Unit]
+Description=Daily tattle security snapshot
+
+[Timer]
+OnCalendar=*-*-* $HOUR:$MIN:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+	systemctl daemon-reload
+	systemctl enable --now tattle.timer
+	systemctl start tattle.service --no-block
+	echo "tattle: installed, runs daily around $HOUR:$(printf %02d $MIN) and now (journalctl -u tattle)"
+else
+	echo "$MIN $HOUR * * * root /bin/sh $DIR/tattle-collect >>/var/log/tattle.log 2>&1" >/etc/cron.d/tattle
+	/bin/sh "$DIR/tattle-collect" >>/var/log/tattle.log 2>&1 &
+	echo "tattle: installed via cron, runs daily at $HOUR:$(printf %02d $MIN)"
+fi
+
+# Canaries for the person who uses this machine (or root on a server).
+# Set TATTLE_NO_CANARIES=1 to skip.
+if [ -z "${TATTLE_NO_CANARIES:-}" ]; then
+	if [ "$(uname -s)" = Darwin ]; then CUSER=${SUDO_USER:-$(stat -f%Su /dev/console)}; else CUSER=${SUDO_USER:-root}; fi
+	CHOME=$(eval echo "~$CUSER")
+	curl -fsS -H "Authorization: Bearer $TOKEN" "$URL/canaries.sh?user=$CUSER" -o "$DIR/canaries.sh"
+	sh -n "$DIR/canaries.sh"
+	if [ "$CUSER" = root ]; then HOME=$CHOME sh "$DIR/canaries.sh"; else sudo -u "$CUSER" HOME="$CHOME" sh "$DIR/canaries.sh"; fi
+	rm -f "$DIR/canaries.sh"
+fi
